@@ -1,0 +1,476 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+AuroraRT 编译工具
+支持多系统架构（Linux、QNX、Windows）
+"""
+
+import os
+import sys
+import argparse
+import subprocess
+import shutil
+import multiprocessing
+import logging
+from pathlib import Path
+from datetime import datetime
+from typing import List, Dict, Optional
+
+# 配置日志系统
+def setup_logging(build_dir: Path) -> logging.Logger:
+    """设置日志系统"""
+    build_dir.mkdir(parents=True, exist_ok=True)
+    log_file = build_dir / f"aurora_build_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+    
+    # 创建日志记录器
+    logger = logging.getLogger('aurora')
+    logger.setLevel(logging.DEBUG)
+    
+    # 清除现有的处理器
+    logger.handlers.clear()
+    
+    # 文件处理器 - 记录所有详细信息
+    fh = logging.FileHandler(log_file, encoding='utf-8')
+    fh.setLevel(logging.DEBUG)
+    
+    # 控制台处理器 - 只显示重要信息
+    ch = logging.StreamHandler()
+    ch.setLevel(logging.INFO)
+    
+    # 格式化器
+    file_formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+    console_formatter = logging.Formatter('%(message)s')
+    
+    fh.setFormatter(file_formatter)
+    ch.setFormatter(console_formatter)
+    
+    logger.addHandler(fh)
+    logger.addHandler(ch)
+    
+    return logger
+
+class AuroraBuild:
+    def __init__(self):
+        self.parser = argparse.ArgumentParser(
+            prog='aurora',
+            description='AuroraRT 编译系统 - 类似 colcon/catkin_make 的编译工具',
+            formatter_class=argparse.RawDescriptionHelpFormatter,
+            epilog="""
+示例用法:
+  aurora build                    # 构建所有项目（自动消息生成）
+  aurora build --packages-select aurorart core
+  aurora clean                    # 清理构建产物
+  aurora env                      # 生成环境设置脚本
+            """
+        )
+        self.subparsers = self.parser.add_subparsers(dest="command", help="子命令")
+        
+        self._add_build_parser()
+        self._add_generate_parser()
+        self._add_clean_parser()
+        self._add_env_parser()
+        self._add_list_parser()
+        
+        self.workspace = Path.cwd()
+        self.build_dir = self.workspace / "build"
+        self.install_dir = self.workspace / "install"
+        self.msg_dir = self.workspace / "msg"
+        self.include_dir = self.workspace / "include"
+        self.logger = None
+
+    def _add_build_parser(self):
+        build_parser = self.subparsers.add_parser("build", help="编译项目")
+        build_parser.add_argument("--workspace", "-w", default=os.getcwd(), help="工作空间目录")
+        build_parser.add_argument("--build-dir", "-b", default="build", help="构建目录")
+        build_parser.add_argument("--install-dir", "-i", default="install", help="安装目录")
+        build_parser.add_argument("--parallel", "-p", type=int, default=multiprocessing.cpu_count(), help="并行构建数量")
+        build_parser.add_argument("--packages-select", "-s", nargs="+", help="选择要构建的包")
+        build_parser.add_argument("--xmake-args", nargs="*", help="传递给 xmake 的参数")
+        build_parser.add_argument("--release", "-r", action="store_true", help="编译 Release 版本")
+        build_parser.add_argument("--debug", "-d", action="store_true", help="编译 Debug 版本")
+        build_parser.add_argument("--verbose", "-v", action="store_true", help="显示详细信息")
+
+    def _add_generate_parser(self):
+        gen_parser = self.subparsers.add_parser("generate", help="生成消息代码")
+        gen_parser.add_argument("--workspace", "-w", default=os.getcwd(), help="工作空间目录")
+        gen_parser.add_argument("--msg-dir", "-m", default="msg", help="消息文件目录")
+        gen_parser.add_argument("--output", "-o", default="include", help="输出目录")
+        gen_parser.add_argument("--type", "-t", default="yas", choices=["yas", "flatbuffers"], help="生成类型")
+        gen_parser.add_argument("--force", "-f", action="store_true", help="强制重新生成")
+
+    def _add_clean_parser(self):
+        clean_parser = self.subparsers.add_parser("clean", help="清理构建产物")
+        clean_parser.add_argument("--workspace", "-w", default=os.getcwd(), help="工作空间目录")
+        clean_parser.add_argument("--build-dir", "-b", default="build", help="构建目录")
+        clean_parser.add_argument("--install-dir", "-i", default="install", help="安装目录")
+        clean_parser.add_argument("--all", "-a", action="store_true", help="清理所有")
+        clean_parser.add_argument("--code", "-c", action="store_true", help="仅清理生成的代码")
+        clean_parser.add_argument("--build", "-B", action="store_true", help="仅清理构建产物")
+
+    def _add_env_parser(self):
+        env_parser = self.subparsers.add_parser("env", help="生成环境设置脚本")
+        env_parser.add_argument("--workspace", "-w", default=os.getcwd(), help="工作空间目录")
+        env_parser.add_argument("--install-dir", "-i", default="install", help="安装目录")
+
+    def _add_list_parser(self):
+        list_parser = self.subparsers.add_parser("list", help="列出项目")
+        list_parser.add_argument("--workspace", "-w", default=os.getcwd(), help="工作空间目录")
+
+    def run(self):
+        args = self.parser.parse_args()
+        
+        if not args.command:
+            self.parser.print_help()
+            return
+        
+        self.workspace = Path(args.workspace)
+        self.build_dir = self.workspace / args.build_dir if hasattr(args, 'build_dir') else self.workspace / "build"
+        self.install_dir = self.workspace / args.install_dir if hasattr(args, 'install_dir') else self.workspace / "install"
+        
+        # 初始化日志系统
+        self.logger = setup_logging(self.build_dir)
+        self.logger.info(f"AuroraRT 构建开始 - 工作空间：{self.workspace}")
+        
+        # 根据详细程度调整日志级别
+        if hasattr(args, 'verbose') and args.verbose:
+            self.logger.handlers[1].setLevel(logging.DEBUG)
+        
+        try:
+            if args.command == "build":
+                self._handle_build(args)
+            elif args.command == "generate":
+                self._handle_generate(args)
+            elif args.command == "clean":
+                self._handle_clean(args)
+            elif args.command == "env":
+                self._handle_env(args)
+            elif args.command == "list":
+                self._handle_list(args)
+        except Exception as e:
+            self.logger.error(f"构建失败：{str(e)}", exc_info=True)
+            print(f"\n[错误] {str(e)}", file=sys.stderr)
+            sys.exit(1)
+
+    def _handle_build(self, args):
+        """构建项目"""
+        self._print_header("AuroraRT 构建系统")
+        self.logger.info("开始构建项目")
+        
+        # 步骤 1: 自动发现并生成消息代码
+        self._print_step(1, "自动检测并生成消息代码")
+        self._auto_generate_messages()
+        
+        # 步骤 2: 发现项目
+        self._print_step(2, "发现项目")
+        projects = self._discover_projects()
+        self.logger.info(f"发现 {len(projects)} 个项目")
+        print(f"  ✓ 找到 {len(projects)} 个项目")
+        
+        # 步骤 3: 解析依赖
+        self._print_step(3, "解析项目依赖")
+        resolved_projects = self._resolve_dependencies(projects)
+        self.logger.info(f"依赖解析完成，构建顺序：{[p['name'] for p in resolved_projects]}")
+        print(f"  ✓ 依赖解析完成")
+        
+        # 步骤 4: 构建项目
+        self._print_step(4, "构建项目")
+        total = len(resolved_projects)
+        for i, project in enumerate(resolved_projects, 1):
+            self.logger.info(f"构建项目：{project['name']} [{i}/{total}]")
+            print(f"  [{i}/{total}] 构建 {project['name']}...")
+            self._build_project(project)
+            print(f"  ✓ {project['name']} 构建完成")
+        
+        # 步骤 5: 生成环境设置
+        self._print_step(5, "生成环境设置脚本")
+        self._generate_env_setup()
+        print(f"  ✓ 环境设置脚本已生成")
+        
+        self.logger.info("构建完成")
+        self._print_success(f"构建完成 - 日志：{self.build_dir / 'aurora_build_*.log'}")
+
+    def _handle_generate(self, args):
+        """生成消息代码"""
+        self._print_header("生成消息代码")
+        self.logger.info("开始生成消息代码")
+        
+        msg_dir = self.workspace / args.msg_dir
+        output_dir = self.workspace / args.output
+        
+        if not msg_dir.exists():
+            self.logger.warning(f"消息目录不存在：{msg_dir}")
+            print(f"[警告] 消息目录不存在：{msg_dir}")
+            return
+        
+        # 生成代码
+        generated_count = self._generate_messages(msg_dir, output_dir, args.type, args.force)
+        
+        self.logger.info(f"生成完成 - 共生成 {generated_count} 个消息文件")
+        self._print_success(f"生成完成 - 共生成 {generated_count} 个消息文件")
+
+    def _handle_clean(self, args):
+        """清理构建产物"""
+        self._print_header("清理构建产物")
+        
+        cleaned_count = 0
+        
+        if args.all or args.code:
+            include_dir = self.workspace / "include"
+            if include_dir.exists():
+                shutil.rmtree(include_dir)
+                print(f"  ✓ 清理生成代码：{include_dir}")
+                cleaned_count += 1
+        
+        if args.all or args.build:
+            # 先关闭日志处理器，避免文件占用
+            logging.shutdown()
+            
+            if self.build_dir.exists():
+                shutil.rmtree(self.build_dir)
+                print(f"  ✓ 清理构建目录：{self.build_dir}")
+                cleaned_count += 1
+            if self.install_dir.exists():
+                shutil.rmtree(self.install_dir)
+                print(f"  ✓ 清理安装目录：{self.install_dir}")
+                cleaned_count += 1
+        
+        print(f"\n✓ 清理完成 - 共清理 {cleaned_count} 个目录")
+
+    def _handle_env(self, args):
+        """生成环境设置脚本"""
+        self._print_header("生成环境设置脚本")
+        self.logger.info("生成环境设置脚本")
+        self._generate_env_setup()
+        self._print_success(f"环境设置脚本已生成到：{self.install_dir}")
+
+    def _handle_list(self, args):
+        """列出项目"""
+        self._print_header("项目列表")
+        projects = self._discover_projects()
+        if not projects:
+            print("未发现项目")
+            return
+        
+        print(f"发现 {len(projects)} 个项目:\n")
+        for project in projects:
+            print(f"  • {project['name']} ({project['type']})")
+            if 'dependencies' in project and project['dependencies']:
+                print(f"    依赖：{', '.join(project['dependencies'])}")
+
+    def _auto_generate_messages(self):
+        """自动生成消息代码"""
+        msg_dirs = []
+        
+        # 查找所有可能的 msg 目录
+        if self.msg_dir.exists():
+            msg_dirs.append(self.msg_dir)
+        
+        # 查找子项目中的 msg 目录
+        for root, dirs, files in os.walk(self.workspace):
+            dirs[:] = [d for d in dirs if d not in ['build', 'install', '.git', 'aurora_build']]
+            if 'msg' in dirs and Path(root) != self.msg_dir:
+                msg_dirs.append(Path(root) / 'msg')
+        
+        total_generated = 0
+        for msg_dir in msg_dirs:
+            if msg_dir.exists():
+                self.logger.info(f"自动检测消息目录：{msg_dir}")
+                print(f"  → 检测消息目录：{msg_dir}")
+                generated_count = self._generate_messages(msg_dir, self.include_dir, "yas", False)
+                if generated_count > 0:
+                    self.logger.info(f"自动生成 {generated_count} 个消息文件")
+                    print(f"    ✓ 生成 {generated_count} 个消息文件")
+                    total_generated += generated_count
+        
+        if total_generated > 0:
+            self._print_success(f"自动生成 {total_generated} 个消息文件")
+        else:
+            print(f"  ℹ 未发现消息文件")
+
+    def _discover_projects(self) -> List[Dict]:
+        """发现项目"""
+        projects = []
+        for root, dirs, files in os.walk(self.workspace):
+            dirs[:] = [d for d in dirs if d not in ['build', 'install', '.git', 'aurora_build']]
+            
+            # 检查 xmake.lua
+            xmake_file = os.path.join(root, 'xmake.lua')
+            if os.path.exists(xmake_file):
+                project = self._parse_xmake_file(xmake_file, root)
+                if project:
+                    projects.append(project)
+        
+        return projects
+
+    def _parse_xmake_file(self, xmake_file: str, project_path: str) -> Optional[Dict]:
+        """解析 xmake.lua"""
+        try:
+            with open(xmake_file, 'r', encoding='utf-8') as f:
+                content = f.read()
+            
+            import re
+            project_match = re.search(r'set_project\s*\(\s*["\']([^"\']+)["\']', content)
+            project_name = project_match.group(1) if project_match else os.path.basename(project_path)
+            
+            return {
+                'name': project_name,
+                'type': 'xmake',
+                'path': project_path,
+                'dependencies': []
+            }
+        except Exception as e:
+            self.logger.error(f"解析 {xmake_file} 失败：{e}")
+            return None
+
+    def _resolve_dependencies(self, projects: List[Dict]) -> List[Dict]:
+        """解析依赖"""
+        # 简单实现，实际应该进行拓扑排序
+        return projects
+
+    def _build_project(self, project: Dict):
+        """构建项目"""
+        project_path = Path(project['path'])
+        
+        try:
+            # 配置
+            self.logger.debug(f"配置项目：{project['name']}")
+            config_cmd = ['xmake', 'config', f'--prefix={self.install_dir}', f'--jobs={multiprocessing.cpu_count()}']
+            self.logger.info(f"执行：{' '.join(config_cmd)}")
+            
+            result = subprocess.run(config_cmd, cwd=project_path, capture_output=True, text=True)
+            if result.returncode != 0:
+                self.logger.error(f"配置失败：{result.stderr}")
+                raise Exception(f"配置失败：{result.stderr}")
+            
+            # 构建
+            self.logger.debug(f"构建项目：{project['name']}")
+            build_cmd = ['xmake']
+            self.logger.info(f"执行：{' '.join(build_cmd)}")
+            
+            result = subprocess.run(build_cmd, cwd=project_path, capture_output=True, text=True)
+            if result.returncode != 0:
+                self.logger.error(f"构建失败：{result.stderr}")
+                raise Exception(f"构建失败：{result.stderr}")
+            
+            # 安装
+            self.logger.debug(f"安装项目：{project['name']}")
+            install_cmd = ['xmake', 'install']
+            self.logger.info(f"执行：{' '.join(install_cmd)}")
+            
+            result = subprocess.run(install_cmd, cwd=project_path, capture_output=True, text=True)
+            if result.returncode != 0:
+                self.logger.error(f"安装失败：{result.stderr}")
+                raise Exception(f"安装失败：{result.stderr}")
+                
+        except subprocess.CalledProcessError as e:
+            self.logger.error(f"构建过程出错：{e}")
+            raise
+
+    def _generate_messages(self, msg_dir: Path, output_dir: Path, gen_type: str, force: bool) -> int:
+        """生成消息代码"""
+        output_dir.mkdir(parents=True, exist_ok=True)
+        msg_files = list(msg_dir.glob("*.msg"))
+        
+        generated_count = 0
+        for msg_file in msg_files:
+            try:
+                self._generate_single_message(msg_file, output_dir, gen_type)
+                generated_count += 1
+            except Exception as e:
+                self.logger.error(f"生成 {msg_file.name} 失败：{e}")
+        
+        return generated_count
+
+    def _generate_single_message(self, msg_file: Path, output_dir: Path, gen_type: str):
+        """生成单个消息"""
+        # 解析消息文件
+        fields = []
+        with open(msg_file, 'r', encoding='utf-8') as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith('#'):
+                    parts = line.split()
+                    if len(parts) >= 2:
+                        fields.append({
+                            'type': parts[0],
+                            'name': parts[1]
+                        })
+        
+        # 生成头文件
+        msg_name = msg_file.stem
+        header_file = output_dir / f"{msg_name}.h"
+        
+        with open(header_file, 'w', encoding='utf-8') as f:
+            guard = f"{msg_name.upper()}_H"
+            f.write(f"#ifndef {guard}\n#define {guard}\n\n")
+            f.write("#include <cstdint>\n#include <string>\n#include <vector>\n\n")
+            f.write(f"struct {msg_name} {{\n")
+            for field in fields:
+                cpp_type = self._ros_type_to_cpp(field['type'])
+                f.write(f"    {cpp_type} {field['name']};\n")
+            f.write(f"}};\n\n#endif // {guard}\n")
+
+    def _ros_type_to_cpp(self, ros_type: str) -> str:
+        """ROS 类型转 C++ 类型"""
+        type_map = {
+            'bool': 'bool',
+            'int8': 'int8_t',
+            'uint8': 'uint8_t',
+            'int16': 'int16_t',
+            'uint16': 'uint16_t',
+            'int32': 'int32_t',
+            'uint32': 'uint32_t',
+            'int64': 'int64_t',
+            'uint64': 'uint64_t',
+            'float32': 'float',
+            'float64': 'double',
+            'string': 'std::string'
+        }
+        if ros_type.endswith('[]'):
+            base_type = ros_type[:-2]
+            return f"std::vector<{type_map.get(base_type, base_type)}>"
+        return type_map.get(ros_type, ros_type)
+
+    def _generate_env_setup(self):
+        """生成环境设置脚本"""
+        self.install_dir.mkdir(parents=True, exist_ok=True)
+        
+        # PowerShell
+        ps1_file = self.install_dir / "setup.ps1"
+        with open(ps1_file, 'w', encoding='utf-8') as f:
+            f.write(f"$env:PATH = \"{self.install_dir}\\bin;$env:PATH\"\n")
+            f.write(f"$env:AURORA_INSTALL_DIR = \"{self.install_dir}\"\n")
+            f.write(f"Write-Host \"AuroraRT 环境已设置\"\n")
+        
+        # Bash
+        bash_file = self.install_dir / "setup.bash"
+        with open(bash_file, 'w', encoding='utf-8') as f:
+            f.write(f"export PATH=\"{self.install_dir}/bin:$PATH\"\n")
+            f.write(f"export AURORA_INSTALL_DIR=\"{self.install_dir}\"\n")
+            f.write(f"echo \"AuroraRT 环境已设置\"\n")
+        
+        # Batch
+        bat_file = self.install_dir / "setup.bat"
+        with open(bat_file, 'w', encoding='utf-8') as f:
+            f.write(f"set PATH={self.install_dir}\\bin;%PATH%\n")
+            f.write(f"set AURORA_INSTALL_DIR={self.install_dir}\n")
+            f.write(f"echo AuroraRT 环境已设置\n")
+
+    def _print_header(self, title: str):
+        """打印标题"""
+        print(f"\n{'='*60}")
+        print(f"{title}")
+        print(f"{'='*60}")
+
+    def _print_step(self, step_num: int, description: str):
+        """打印步骤"""
+        print(f"\n[步骤 {step_num}/5] {description}")
+        print(f"{'-'*60}")
+
+    def _print_success(self, message: str):
+        """打印成功消息"""
+        print(f"\n✓ {message}")
+
+if __name__ == "__main__":
+    aurora = AuroraBuild()
+    aurora.run()
